@@ -4661,6 +4661,9 @@ class BulkEmailSender:
         """Start Direct MX sending campaign."""
         if self.running:
             return
+        if not self.enable_direct_mx_var.get():
+            messagebox.showinfo("Disabled", "Direct MX Delivery Mode is disabled. Enable it first.")
+            return
         if not self.mx_email_list:
             messagebox.showinfo("No Recipients", "Please load a Direct MX email list first.")
             return
@@ -4705,8 +4708,8 @@ class BulkEmailSender:
         if hasattr(self, 'mx_rate_limit_var'):
             try:
                 self.direct_mx_handler.rate_limit_per_hour = self.mx_rate_limit_var.get()
-            except Exception:
-                pass
+            except (tk.TclError, ValueError) as e:
+                self.log(f"⚠️ Invalid rate limit value, using default: {e}")
 
         use_random = self.mx_use_random_sender_var.get()
         self.direct_mx_handler.run_direct_mx_sending_job(
