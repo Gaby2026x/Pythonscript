@@ -1412,6 +1412,7 @@ class DirectMXHandler:
             self.resolver.timeout = 5
             self.resolver.lifetime = 10
         self.rate_limits = {}  # Per-domain rate limiting: {'domain': {'last_send': datetime, 'count': int}}
+        self.rate_limit_per_hour = 100  # Configurable rate limit per domain per hour
         self.dkim_private_key = ""
         self.dkim_selector = ""
         self.dkim_domain = ""
@@ -1512,7 +1513,7 @@ class DirectMXHandler:
             return mime_msg
 
     def _check_rate_limit(self, domain):
-        """Check per-domain rate limit (e.g., 100/hour)."""
+        """Check per-domain rate limit."""
         now = datetime.now()
         if domain not in self.rate_limits:
             self.rate_limits[domain] = {'last_send': now, 'count': 0}
@@ -1520,7 +1521,7 @@ class DirectMXHandler:
         if (now - record['last_send']).total_seconds() > 3600:  # Reset every hour
             record['count'] = 0
             record['last_send'] = now
-        if record['count'] >= 100:  # Limit 100/hour
+        if record['count'] >= self.rate_limit_per_hour:
             return False
         record['count'] += 1
         return True
@@ -1571,8 +1572,8 @@ class DirectMXHandler:
             # Determine sender identity: use email_data overrides, then rotation pool, then defaults
             sender_name = email_data.get('sender_name', 'Sender')
             sender_email = email_data.get('sender_email', '')
-            if not sender_email:
-                sender_email = self.get_rotated_sender("noreply@example.com")
+            if email_data.get('use_random_sender') or not sender_email:
+                sender_email = self.get_rotated_sender(sender_email or "noreply@example.com")
             # Create MIME message
             mime_msg = self._create_mime_message(
                 email_data['to_email'], email_data['subject'], email_data['content'],
@@ -1766,7 +1767,7 @@ class DirectMXHandler:
 
         return False, "All MX failed"
 
-    def run_direct_mx_sending_job(self, email_list, subject, content, attachments=None, batch_size=100):
+    def run_direct_mx_sending_job(self, email_list, subject, content, attachments=None, batch_size=100, use_random_sender=False):
         """Main async sending job for Direct MX."""
         if not DNSPYTHON_AVAILABLE:
             self.main_app.log("❌ dnspython not available for Direct MX delivery.")
@@ -1782,20 +1783,24 @@ class DirectMXHandler:
                     await asyncio.sleep(0.5)
                     if not self.main_app.running or not self.main_app.direct_mx_running:
                         return False, "Stopped"
-                email_data = self.main_app._prepare_email_data_vps(email_address_lower, subject, content, attachments, False, 0, len(email_list))
+                email_data = self.main_app._prepare_email_data_mx(email_address_lower, subject, content, attachments, use_random_sender, 0, len(email_list))
                 success, error = await self._send_single_email_direct(email_data)
                 if success:
-                    self.main_app.tracking_map[email_address_lower]['status'] = 'Sent (MX)'
+                    self.main_app.mx_tracking_map[email_address_lower]['status'] = 'Sent (MX)'
+                    self.main_app.mx_tracking_map[email_address_lower]['sent_time'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     self.main_app.sent_count += 1
                     self.main_app.direct_mx_sent_count += 1
-                    self.main_app.gui_update_queue.put(('update_recipient', email_address_lower))
+                    self.main_app.gui_update_queue.put(('update_mx_recipient', email_address_lower))
                     self.main_app.gui_update_queue.put(('update_progress', None))
                     return True, "Sent"
                 else:
-                    self.main_app.tracking_map[email_address_lower]['status'] = f'Failed (MX: {error})'
+                    self.main_app.mx_tracking_map[email_address_lower]['status'] = f'Failed (MX: {error})'
+                    self.main_app.mx_tracking_map[email_address_lower]['failure_reason'] = error
+                    attempts = self.main_app.mx_tracking_map[email_address_lower].get('attempts', 0) + 1
+                    self.main_app.mx_tracking_map[email_address_lower]['attempts'] = attempts
                     self.main_app.failed_count += 1
                     self.main_app.direct_mx_failed_count += 1
-                    self.main_app.gui_update_queue.put(('update_recipient', email_address_lower))
+                    self.main_app.gui_update_queue.put(('update_mx_recipient', email_address_lower))
                     self.main_app.gui_update_queue.put(('update_progress', None))
                     return False, error
 
@@ -4468,12 +4473,15 @@ class BulkEmailSender:
         tk.Button(network_frame, text="🧪 Test MX Connection", command=self._test_mx_connection, bg="#2ecc71", fg="white", font=("Arial", 9)).grid(row=2, column=0, padx=5, pady=5, sticky='ew')
         tk.Button(network_frame, text="🔍 Validate Network", command=self._validate_mx_network, bg="#3498db", fg="white", font=("Arial", 9)).grid(row=2, column=1, padx=5, pady=5, sticky='ew')
 
-        # Batch Size
+        # Batch Size and Rate Limit
         batch_frame = tk.Frame(config_frame, bg='#e0f7ff')
         batch_frame.pack(fill='x', padx=10, pady=5)
         tk.Label(batch_frame, text="Batch Size:", bg='#e0f7ff', fg="#2c3e50").pack(side=tk.LEFT)
         self.mx_batch_size_var = tk.IntVar(value=100)
         tk.Entry(batch_frame, textvariable=self.mx_batch_size_var, bg="white", fg="#2c3e50", width=10).pack(side=tk.LEFT, padx=5)
+        tk.Label(batch_frame, text="Rate Limit/hr/domain:", bg='#e0f7ff', fg="#2c3e50").pack(side=tk.LEFT, padx=(10, 0))
+        self.mx_rate_limit_var = tk.IntVar(value=100)
+        tk.Entry(batch_frame, textvariable=self.mx_rate_limit_var, bg="white", fg="#2c3e50", width=10).pack(side=tk.LEFT, padx=5)
 
         # Controls
         mx_controls_frame = tk.Frame(config_frame, bg='#e0f7ff')
@@ -4587,6 +4595,8 @@ class BulkEmailSender:
         self.mx_tree.pack(fill='both', expand=True)
 
         self.mx_email_list = []
+        self.mx_tracking_map = {}
+        self.mx_tree_items = {}
         self.mx_attachment_paths = []
 
         self.mx_stats_label = tk.Label(recipients_frame, text="📊 MX Stats: 0 sent | 0 failed | 0 total", font=("Arial", 10), bg='#e0f7ff', fg="#666")
@@ -4671,6 +4681,9 @@ class BulkEmailSender:
         self.direct_mx_sent_count = 0
         self.direct_mx_failed_count = 0
         self.direct_mx_retry_count = 0
+        # Reset tracking status for all MX recipients
+        for email in self.mx_email_list:
+            self.mx_tracking_map[email] = {'email': email, 'status': 'Queued', 'attempts': 0}
         self.mx_start_btn.config(state="disabled")
         self.mx_pause_btn.config(state="normal")
         self.mx_stop_btn.config(state="normal")
@@ -4682,9 +4695,24 @@ class BulkEmailSender:
         self.direct_mx_handler.source_ip = self.mx_source_ip_var.get()
         self.direct_mx_handler.ehlo_hostname = self.mx_ehlo_hostname_var.get()
 
+        # Sync from pool from GUI entry if not already populated via verify window
+        from_pool_text = self.mx_from_pool_var.get().strip()
+        if from_pool_text and not self.direct_mx_handler.from_emails_pool:
+            pool_emails = [e.strip() for e in from_pool_text.split(',') if '@' in e.strip()]
+            self.direct_mx_handler.from_emails_pool = pool_emails
+
+        # Sync rate limit from GUI if available
+        if hasattr(self, 'mx_rate_limit_var'):
+            try:
+                self.direct_mx_handler.rate_limit_per_hour = self.mx_rate_limit_var.get()
+            except Exception:
+                pass
+
+        use_random = self.mx_use_random_sender_var.get()
         self.direct_mx_handler.run_direct_mx_sending_job(
             self.mx_email_list, subject, content,
-            self.mx_attachment_paths, self.mx_batch_size_var.get()
+            self.mx_attachment_paths, self.mx_batch_size_var.get(),
+            use_random_sender=use_random
         )
 
     def _pause_direct_mx_sending(self):
@@ -4751,7 +4779,9 @@ class BulkEmailSender:
                     emails = [line.strip() for line in f if '@' in line.strip()]
                 self.mx_email_list = emails
                 for email in emails:
-                    self.mx_tree.insert("", tk.END, values=(email, "Pending", "", "0", ""))
+                    self.mx_tracking_map[email] = {'email': email, 'status': 'Pending'}
+                    item_id = self.mx_tree.insert("", tk.END, values=(email, "Pending", "", "0", ""))
+                    self.mx_tree_items[email] = item_id
                 self.mx_stats_label.config(text=f"📊 MX Stats: 0 sent | 0 failed | {len(emails)} total")
                 self.log(f"📁 Loaded {len(emails)} emails for Direct MX.")
             except Exception as e:
@@ -4764,7 +4794,9 @@ class BulkEmailSender:
             emails = [line.strip() for line in clipboard.split('\n') if '@' in line.strip()]
             self.mx_email_list.extend(emails)
             for email in emails:
-                self.mx_tree.insert("", tk.END, values=(email, "Pending", "", "0", ""))
+                self.mx_tracking_map[email] = {'email': email, 'status': 'Pending'}
+                item_id = self.mx_tree.insert("", tk.END, values=(email, "Pending", "", "0", ""))
+                self.mx_tree_items[email] = item_id
             self.mx_stats_label.config(text=f"📊 MX Stats: 0 sent | 0 failed | {len(self.mx_email_list)} total")
             self.log(f"📋 Pasted {len(emails)} emails for Direct MX.")
         except Exception as e:
@@ -4780,7 +4812,9 @@ class BulkEmailSender:
             messagebox.showinfo("Exists", "Email already in list.")
             return
         self.mx_email_list.append(email)
-        self.mx_tree.insert("", tk.END, values=(email, "Pending", "", "0", ""))
+        self.mx_tracking_map[email] = {'email': email, 'status': 'Pending'}
+        item_id = self.mx_tree.insert("", tk.END, values=(email, "Pending", "", "0", ""))
+        self.mx_tree_items[email] = item_id
         self.mx_stats_label.config(text=f"📊 MX Stats: 0 sent | 0 failed | {len(self.mx_email_list)} total")
         self.new_mx_recipient_var.set("")
         self.log(f"✅ Added Direct MX recipient: {email}")
@@ -4788,6 +4822,8 @@ class BulkEmailSender:
     def _clear_mx_email_list(self):
         """Clear Direct MX email list."""
         self.mx_email_list = []
+        self.mx_tracking_map.clear()
+        self.mx_tree_items.clear()
         for item in self.mx_tree.get_children():
             self.mx_tree.delete(item)
         self.mx_stats_label.config(text="📊 MX Stats: 0 sent | 0 failed | 0 total")
@@ -8160,6 +8196,13 @@ class BulkEmailSender:
                 vps_sent = sum(1 for d in self.vps_tracking_map.values() if d.get('status', '').startswith('Sent')) if hasattr(self, 'vps_tracking_map') else 0
                 vps_failed = sum(1 for d in self.vps_tracking_map.values() if d.get('status', '') in ('Failed', 'Error') or 'Failed' in d.get('status', '')) if hasattr(self, 'vps_tracking_map') else 0
                 self.vps_stats_label.config(text=f"📊 VPS Stats: {vps_sent} sent | {vps_failed} failed | {vps_total} total")
+
+            # Update MX stats label if available
+            if hasattr(self, 'mx_stats_label') and self.mx_stats_label.winfo_exists():
+                mx_total = len(self.mx_email_list) if hasattr(self, 'mx_email_list') else 0
+                mx_sent = self.direct_mx_sent_count if hasattr(self, 'direct_mx_sent_count') else 0
+                mx_failed = self.direct_mx_failed_count if hasattr(self, 'direct_mx_failed_count') else 0
+                self.mx_stats_label.config(text=f"📊 MX Stats: {mx_sent} sent | {mx_failed} failed | {mx_total} total")
         except Exception:
             pass
 
@@ -9425,6 +9468,18 @@ class BulkEmailSender:
                             sent_time = sent_time.split(' ')[1]
                         values = (email, d.get('status', 'Pending'), sent_time, str(d.get('attempts', 0)), d.get('failure_reason', ''))
                         self.vps_tree.item(item_id, values=values, tags=(d.get('status', '').split(' ')[0],))
+                elif kind == "update_mx_recipient":
+                    email = args[0]
+                    if hasattr(self, 'mx_tree_items') and email in self.mx_tree_items:
+                        item_id = self.mx_tree_items[email]
+                        d = self.mx_tracking_map.get(email, {})
+                        sent_time = d.get('sent_time', '')
+                        if sent_time and ' ' in sent_time:
+                            sent_time = sent_time.split(' ')[1]
+                        values = (email, d.get('status', 'Pending'), sent_time, str(d.get('attempts', 0)), d.get('failure_reason', ''))
+                        self.mx_tree.item(item_id, values=values, tags=(d.get('status', '').split(' ')[0],))
+                        for tag, color in [('Sent', '#d4edda'), ('Failed', '#f8d7da'), ('Error', '#f8d7da'), ('Queued', '#d1ecf1')]:
+                            self.mx_tree.tag_configure(tag, background=color)
                 elif kind == "log_message":
                     log_batch.append(args[0])
                 elif kind == "update_progress":
@@ -9990,6 +10045,34 @@ class BulkEmailSender:
             "sender_email": self.vps_sender_email_var.get(),
             "reply_to": self.vps_reply_to_var.get() if hasattr(self, 'vps_reply_to_var') else "",
             "message_id_domain": self.vps_message_id_domain_var.get() if hasattr(self, 'vps_message_id_domain_var') else "",
+        }
+
+    def _prepare_email_data_mx(self, email_address, base_subject, base_content, attachments, use_random_sender, index=0, total=0):
+        """MX-specific version of email data preparation using MX sender variables."""
+        subj = self.deliverability_helper.spin(base_subject)
+        spun_content = self.deliverability_helper.spin(base_content)
+        tracked_content = self._add_tracking_to_content(spun_content, email_address) if self.tracking_enabled.get() else spun_content
+
+        personalized_subject, personalized_content, new_data, unsubscribe_url = self._personalize_content(
+            email_address, subj, tracked_content
+        )
+
+        if CSS_INLINE_AVAILABLE:
+            ok, inlined_content = self.html_helper.inline_css(personalized_content)
+            if ok:
+                personalized_content = inlined_content
+
+        return {
+            "to_email": email_address,
+            "subject": personalized_subject,
+            "content": personalized_content,
+            "attachments": attachments or [],
+            "unsubscribe_url": unsubscribe_url,
+            "use_random_sender": use_random_sender,
+            "sender_name": self.mx_sender_name_var.get() if hasattr(self, 'mx_sender_name_var') else "Sender",
+            "sender_email": self.mx_sender_email_var.get() if hasattr(self, 'mx_sender_email_var') else "noreply@example.com",
+            "reply_to": self.mx_reply_to_var.get() if hasattr(self, 'mx_reply_to_var') else "",
+            "message_id_domain": self.mx_message_id_domain_var.get() if hasattr(self, 'mx_message_id_domain_var') else "",
         }
 
     def _start_vps_sending(self):
